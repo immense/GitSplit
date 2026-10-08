@@ -4597,6 +4597,740 @@ function Get-CommitMessageFromChanges {
   return "Update changes"
 }
 
+################################################################################
+# Split-ByPath
+#
+# Destructive-by-default note for reviewers / static analyzers:
+# ----------------------------------------------------------------------------
+# Split-ByPath and Move-Commit are INTENTIONALLY destructive by default
+# (-RemoveFromSource defaults to $true). This mirrors the semantics of a
+# filesystem `mv`: "split" and "move" carry an inherent removal, and a
+# non-destructive copy is the opt-in (-RemoveFromSource:$false), not the
+# default. This is NOT a defect to be flagged. These cmdlets emit reviewable
+# git scripts (via -OutputScriptPath) whose *purpose* is the destructive
+# operation (history rewrite of the source branch); every git reset / commit /
+# update-ref / push --force-with-lease is present as plain text in the
+# generated script for a human to read before execution. Defaulting to
+# non-destructive would make the verbs useless by default (a "split" that
+# leaves the paths in the source is a copy, not a split). Same principle as
+# `git mv` / `mv` being destructive by default.
+################################################################################
+
+function New-SplitByPathPlan {
+  <#
+  .SYNOPSIS
+    Builds the execution plan for Split-ByPath (extract paths across BaseRef..HEAD into a separate branch).
+
+  .DESCRIPTION
+    Range-aware counterpart to Split-Commit / Move-Commit. Extracts the net change to a set of paths
+    across the BaseRef..HEAD range into a destination branch, and (destructive by default) rewrites the
+    current branch so it no longer contains those paths' changes.
+
+    The tip is always the current branch HEAD (no -TipRef): the verb's contract is "I'm on my feature
+    branch; extract these paths into a separate PR," and -RemoveFromSource rewrites *the branch you're
+    on*. A free tip would make the destructive default ambiguous about which branch it destroys.
+
+    Two modes:
+      - -Squash (default): pure git. `git reset --soft BaseRef` stages the entire range, then commits
+        the paths and the remainder from the index. Committing from the index (not reconstructing via
+        `git checkout`) correctly handles adds, modifies, AND deletions uniformly -- no git rm
+        special-case. The source collapses to ONE squashed commit.
+      - -Squash:$false (preserve): replays each BaseRef..HEAD commit with the paths held at their
+        BaseRef state (pure git: a temporary index plus commit-tree). Keeps the source's commit
+        structure minus the paths' changes; commits before BaseRef keep their SHAs.
+
+    Stacked vs flat destination (default stacked when destructive):
+      - Stacked (default, -RemoveFromSource): destination parented on the rewritten source tip; its PR
+        base is the source branch so the diff shows only the extracted paths.
+      - Flat (-DestinationBase <ref>, or copy mode): destination parented on -DestinationBase (or
+        BaseRef) as an independent sibling.
+
+    The destination commit applies the paths' net BaseRef..HEAD change to its parent as a 3-way patch,
+    never the paths' whole HEAD snapshot, which would also carry edits made between an older
+    -DestinationBase and BaseRef. If the change does not apply cleanly, the plan throws before any ref
+    moves.
+
+    This builder returns a New-GitPlan of Comment/Literal steps (the same plan/execute model as
+    Move-Commit), so the plan both renders to a reviewable script (Write-GitScript) and executes
+    (Invoke-GitPlan).
+
+  .NOTES
+    History rewrite changes commit SHAs (squash: the whole range collapses to one new SHA; preserve:
+    every commit from first-path-touch onward is re-hashed). SHAs cited in PR review threads become
+    dangling on GitHub after force-push. On completion the plan prints the source branch's old and new
+    tip and, in preserve mode, each rewritten commit's old -> new SHA (or that it was dropped);
+    automatic review-thread SHA migration is out of scope.
+  #>
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$Path,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$DestinationBranch,
+
+    [Parameter()]
+    [string]$BaseRef,
+
+    [Parameter()]
+    [string]$DestinationBase,
+
+    [Parameter()]
+    [switch]$Squash,
+
+    [Parameter()]
+    [switch]$RemoveFromSource,
+
+    [Parameter()]
+    [string]$SourceMessage,
+
+    [Parameter()]
+    [string]$DestinationMessage,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePushSource,
+
+    [Parameter()]
+    [switch]$AutoStash,
+
+    [Parameter()]
+    [switch]$KeepEmpty
+  )
+
+  # --- effective defaults for switch params that default to $true ---
+  $squash = if ($PSBoundParameters.ContainsKey('Squash')) { [bool]$Squash } else { $true }
+  $removeFromSource = if ($PSBoundParameters.ContainsKey('RemoveFromSource')) { [bool]$RemoveFromSource } else { $true }
+
+  $repoRoot = Get-GitRepoRoot
+  $currentBranch = Get-GitCurrentBranch
+  if ($currentBranch -eq 'HEAD') {
+    throw "You are in a detached HEAD state. Checkout a branch before calling Split-ByPath (the tip is always the current branch HEAD)."
+  }
+  $currentHead = Resolve-GitCommit -Ref 'HEAD' -ErrorMessage 'Failed to resolve HEAD.'
+
+  # --- resolve BaseRef (default: merge-base(HEAD, origin/HEAD)) ---
+  if ([string]::IsNullOrWhiteSpace($BaseRef)) {
+    $originHeadQuery = Invoke-GitQuery -AllowFailure -GitArgs @('symbolic-ref', 'refs/remotes/origin/HEAD')
+    $originHeadRef = $originHeadQuery.Output.Trim()
+    if ([string]::IsNullOrWhiteSpace($originHeadRef)) {
+      throw "Split-ByPath could not determine the default branch (origin/HEAD is unset). Specify -BaseRef explicitly, or run: git remote set-head origin <branch>"
+    }
+    $trunk = $originHeadRef -replace '^refs/remotes/origin/', ''
+    $mbQuery = Invoke-GitQuery -AllowFailure -GitArgs @('merge-base', 'HEAD', "origin/$trunk")
+    $BaseRef = $mbQuery.Output.Trim()
+    if ([string]::IsNullOrWhiteSpace($BaseRef)) {
+      throw "Failed to compute merge-base(HEAD, origin/$trunk). Specify -BaseRef explicitly."
+    }
+  }
+  $baseCommit = Resolve-GitCommit -Ref $BaseRef -ErrorMessage "Base reference '$BaseRef' is not valid."
+
+  # --- range guards ---
+  if ($baseCommit -eq $currentHead) {
+    throw "BaseRef and HEAD resolve to the same commit ($baseCommit); nothing to split."
+  }
+  if (-not (Test-GitCommitIsAncestor -Ancestor $baseCommit -Descendant $currentHead)) {
+    throw "BaseRef '$BaseRef' ($baseCommit) is not an ancestor of HEAD ($currentHead)."
+  }
+
+  # --- destination branch must not exist (a split creates a new PR branch; clobbering would be unsafe) ---
+  # Checked before the path-diff check so an obviously wrong destination name fails fast.
+  $destExistsLocal = Test-GitRefExists -Ref "refs/heads/$DestinationBranch"
+  $destExistsRemote = Test-GitRefExists -Ref "refs/remotes/origin/$DestinationBranch"
+  if ($destExistsLocal -or $destExistsRemote) {
+    $hints = @("  git branch -D $DestinationBranch")
+    if ($destExistsRemote) {
+      $hints += "  git push origin --delete $DestinationBranch"
+    }
+    throw (@(
+      "Destination branch '$DestinationBranch' already exists locally or on origin."
+      "A split creates a new branch; delete it first or choose a different name:"
+    ) + $hints) -join [Environment]::NewLine
+  }
+
+  # --- normalize paths to repo-relative ---
+  $normalizedPaths = @($Path | ForEach-Object { ConvertTo-GitSplitRepoRelativePath -Path $_ -RepoRoot $repoRoot } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+  if ($normalizedPaths.Count -eq 0) {
+    throw "No valid paths to extract after normalization."
+  }
+
+  # --- verify the paths actually changed in the range ---
+  $diffArgs = @('diff', '--name-only', "$baseCommit..$currentHead", '--') + $normalizedPaths
+  $diffQuery = Invoke-GitQuery -AllowFailure -GitArgs $diffArgs
+  $changedPaths = @($diffQuery.Lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  if ($changedPaths.Count -eq 0) {
+    throw "No changes to the specified paths in $baseCommit..$currentHead; nothing to extract."
+  }
+
+  # --- resolve destination base ---
+  $providedDestinationBase = -not [string]::IsNullOrWhiteSpace($DestinationBase)
+  $destinationBaseCommit = $null
+  if ($providedDestinationBase) {
+    $destinationBaseCommit = Resolve-GitCommit -Ref $DestinationBase -ErrorMessage "Destination base reference '$DestinationBase' is not valid."
+    if ($baseCommit -ne $destinationBaseCommit -and -not (Test-GitCommitIsAncestor -Ancestor $destinationBaseCommit -Descendant $currentHead)) {
+      throw "DestinationBase '$DestinationBase' ($destinationBaseCommit) must be either BaseRef or an ancestor of HEAD."
+    }
+  }
+  # Stacked (dest on rewritten source tip) is the default ONLY for the destructive case.
+  # For copy mode (RemoveFromSource:$false) the source keeps the paths, so a dest stacked on the
+  # source would show an empty diff -> default copy mode to flat (dest on BaseRef).
+  $stacked = $false
+  if (-not $providedDestinationBase) {
+    if ($removeFromSource) {
+      $stacked = $true   # dest parent resolved to $sourceTip in-script
+    }
+    else {
+      $destinationBaseCommit = $baseCommit   # flat on BaseRef
+    }
+  }
+
+  # --- defaults for commit messages ---
+  if ([string]::IsNullOrWhiteSpace($SourceMessage)) {
+    $SourceMessage = "Split: extract paths into $DestinationBranch"
+  }
+  if ([string]::IsNullOrWhiteSpace($DestinationMessage)) {
+    $pathList = ($normalizedPaths -join ', ')
+    if ($pathList.Length -gt 80) { $pathList = $pathList.Substring(0, 77) + '...' }
+    $DestinationMessage = "Extract: $pathList"
+  }
+
+  $plannedWorktreePath = New-GitSplitWorktreePath -RepoRoot $repoRoot
+  $plannedStashName = New-GitSplitStashName -Operation 'split-bypath'
+  $plannedScratchPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-splitbypath'
+  $plannedDisabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
+
+  # ===========================================================================
+  # Build plan steps
+  # ===========================================================================
+  $steps = @()
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Split-ByPath execution plan.',
+    'Discovery-time values are frozen below; runtime guards ensure the repository has not drifted.',
+    'Destructive by default (-RemoveFromSource): the source branch is rewritten to drop the extracted paths, like `mv`.'
+  )
+
+  # --- frozen values ---
+  $frozenLines = @(
+    '$expectedRepoRoot = ' + (ConvertTo-PowerShellStringLiteral $repoRoot)
+    '$expectedBranch = ' + (ConvertTo-PowerShellStringLiteral $currentBranch)
+    '$expectedHead = ' + (ConvertTo-PowerShellStringLiteral $currentHead)
+    '$baseCommit = ' + (ConvertTo-PowerShellStringLiteral $baseCommit)
+    '$destinationBranch = ' + (ConvertTo-PowerShellStringLiteral $DestinationBranch)
+    '$paths = @(' + (($normalizedPaths | ForEach-Object { ConvertTo-PowerShellStringLiteral $_ }) -join ', ') + ')'
+    '$squash = ' + $(if ($squash) { '$true' } else { '$false' })
+    '$removeFromSource = ' + $(if ($removeFromSource) { '$true' } else { '$false' })
+    '$stacked = ' + $(if ($stacked) { '$true' } else { '$false' })
+    '$push = ' + $(if ($Push) { '$true' } else { '$false' })
+    '$forcePushSource = ' + $(if ($ForcePushSource) { '$true' } else { '$false' })
+    '$autoStash = ' + $(if ($AutoStash) { '$true' } else { '$false' })
+    '$keepEmpty = ' + $(if ($KeepEmpty) { '$true' } else { '$false' })
+    '$plannedStashName = ' + (ConvertTo-PowerShellStringLiteral $plannedStashName)
+    '$worktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedWorktreePath)
+    '$scratchPath = ' + (ConvertTo-PowerShellStringLiteral $plannedScratchPath)
+    '$disabledHooksPath = ' + (ConvertTo-PowerShellStringLiteral $plannedDisabledHooksPath)
+    '$stashed = $false'
+    '$stashName = $null'
+    '$worktreeCreated = $false'
+    '$scratchCreated = $false'
+    '$succeeded = $false'
+  )
+  $frozenLines += ConvertTo-PowerShellHereStringLines -AssignmentPrefix '$sourceMessage = ' -Value $SourceMessage
+  $frozenLines += ConvertTo-PowerShellHereStringLines -AssignmentPrefix '$destinationMessage = ' -Value $DestinationMessage
+  if ($providedDestinationBase) {
+    $frozenLines += @(
+      '$destinationBaseCommit = ' + (ConvertTo-PowerShellStringLiteral $destinationBaseCommit)
+    )
+  }
+  else {
+    $frozenLines += @('$destinationBaseCommit = $null')
+  }
+  $steps += New-GitStep -Kind Literal -Lines $frozenLines
+
+  # --- runtime drift guards ---
+  $guardLines = @(
+    '$repoRoot = (& git rev-parse --show-toplevel).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) { throw "Split-ByPath must be run inside a git repository." }'
+    'if ($repoRoot -ne $expectedRepoRoot) { throw "This script was generated for repo root ''$expectedRepoRoot'' but is running in ''$repoRoot''." }'
+    '$currentBranch = (& git rev-parse --abbrev-ref HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) { throw "Failed to get current branch." }'
+    'if ($currentBranch -ne $expectedBranch) { throw "This script expected branch ''$expectedBranch'' but found ''$currentBranch''." }'
+    '$currentHead = (& git rev-parse HEAD).Trim()'
+    'if ($LASTEXITCODE -ne 0 -or $currentHead -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to resolve HEAD." }'
+    'if ($currentHead -ne $expectedHead) { throw "This script expected HEAD ''$expectedHead'' but found ''$currentHead''. Re-run Split-ByPath to regenerate the plan." }'
+    # destination must still not exist
+    '& git show-ref --verify --quiet "refs/heads/$destinationBranch"'
+    'if ($LASTEXITCODE -eq 0) { throw "Destination branch ''$destinationBranch'' now exists locally; refusing to clobber." }'
+    '& git show-ref --verify --quiet "refs/remotes/origin/$destinationBranch"'
+    'if ($LASTEXITCODE -eq 0) { throw "Destination branch ''$destinationBranch'' now exists on origin; refusing to clobber." }'
+    # working tree cleanliness / autostash
+    '$status = @(& git status --porcelain)'
+    'if ($LASTEXITCODE -ne 0) { throw "Failed to determine git status." }'
+    '$untrackedFiles = @($status | Where-Object { $_ -match "^\?\? " })'
+    '$modifiedFiles = @($status | Where-Object { $_ -notmatch "^\?\? " })'
+    'if ($modifiedFiles.Count -gt 0) {'
+    '  if (-not $autoStash) {'
+    '    $fileList = ($modifiedFiles | ForEach-Object { $_.Substring(3) }) -join ", "'
+    '    throw "Uncommitted changes detected in: $fileList. Re-run with -AutoStash, or commit/stash your changes before running this script."'
+    '  }'
+    '  $stashName = $plannedStashName'
+    '  & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) { throw "git stash push failed" }'
+    '  $stashed = $true'
+    '}'
+    'elseif ($untrackedFiles.Count -gt 0 -and $autoStash) {'
+    '  $stashName = $plannedStashName'
+    '  & git stash push -u -m $stashName 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) { throw "git stash push failed" }'
+    '  $stashed = $true'
+    '}'
+    'elseif ($untrackedFiles.Count -gt 0) {'
+    '  Write-Warning "Untracked files present ($($untrackedFiles.Count)). They will not be affected by this operation."'
+    '}'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $guardLines
+
+  # --- execution ---
+  $execLines = @(
+    '$longPathGitArgs = @()'
+    'if ($env:OS -eq ''Windows_NT'') { $longPathGitArgs = @(''-c'', ''core.longpaths=true'') }'
+    '$sourceTip = $null'
+    '$destSha = $null'
+    '# old -> new SHA of every rewritten source commit (preserve mode), printed on completion.'
+    '$commitMap = [ordered]@{}'
+    '$droppedCommits = @{}'
+    '# The temporary-index steps set these variables; the finally block restores the caller''s values.'
+    '$gitEnvNames = @(''GIT_INDEX_FILE'', ''GIT_AUTHOR_NAME'', ''GIT_AUTHOR_EMAIL'', ''GIT_AUTHOR_DATE'', ''GIT_COMMITTER_NAME'', ''GIT_COMMITTER_EMAIL'', ''GIT_COMMITTER_DATE'')'
+    '$savedGitEnv = @{}'
+    'foreach ($name in $gitEnvNames) { $savedGitEnv[$name] = [Environment]::GetEnvironmentVariable($name) }'
+    '# Removes the variable for $null: [Environment]::SetEnvironmentVariable would get "" from PowerShell'
+    '# for a $null value and leave an empty variable behind, which breaks git (e.g. GIT_INDEX_FILE="").'
+    'function Set-GitSplitEnv([string]$Name, $Value) {'
+    '  if ($null -eq $Value) { Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue }'
+    '  else { Set-Item -LiteralPath "Env:$Name" -Value $Value }'
+    '}'
+    'if (Test-Path -LiteralPath $scratchPath) { throw "Planned scratch path ''$scratchPath'' already exists." }'
+    'try {'
+    '  New-Item -Path $scratchPath -ItemType Directory -Force | Out-Null'
+    '  $scratchCreated = $true'
+    '  $tempIndexPath = Join-Path $scratchPath ''index'''
+    '  $patchPath = Join-Path $scratchPath ''paths.patch'''
+    '  $messagePath = Join-Path $scratchPath ''message.txt'''
+    '  $identityPath = Join-Path $scratchPath ''identity.txt'''
+  )
+
+  if ($squash) {
+    $execLines += @(
+      ''
+      '  # --- squash mode: the source collapses to ONE commit, built from the index in a temp worktree ---'
+      '  if (Test-Path -LiteralPath $worktreePath) { throw "Planned worktree path ''$worktreePath'' already exists." }'
+      '  if (-not (Test-Path -LiteralPath $disabledHooksPath)) { New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null }'
+      '  & git @longPathGitArgs worktree add --detach $worktreePath $expectedHead 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) { throw "git worktree add --detach failed" }'
+      '  $worktreeCreated = $true'
+      ''
+      '  # Stage the entire BaseRef..HEAD change set (index == HEAD tree), then unstage the extract paths.'
+      '  & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" reset --soft $baseCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) { throw "git reset --soft failed" }'
+      '  & git @longPathGitArgs -C $worktreePath reset HEAD -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) { throw "git reset HEAD -- <paths> failed" }'
+      ''
+      '  # Source commit: everything EXCEPT the extract paths (committed from the index).'
+      '  # If ALL changed paths are being extracted, the index matches the base (nothing staged) and the'
+      '  # source collapses straight onto the base with no commit of its own -- the split becomes a pure'
+      '  # "move everything to a new branch" (stacked and flat coincide on the base).'
+      '  $null = & git @longPathGitArgs -C $worktreePath diff --cached --quiet 2>&1'
+      '  $sourceHasChanges = ($LASTEXITCODE -ne 0)'
+      '  if ($sourceHasChanges) {'
+      '    & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" commit -m $sourceMessage --quiet 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '    if ($LASTEXITCODE -ne 0) { throw "git commit (source) failed" }'
+      '    $sourceTip = (& git -C $worktreePath rev-parse HEAD).Trim()'
+      '    if ($LASTEXITCODE -ne 0 -or $sourceTip -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to resolve source tip." }'
+      '  }'
+      '  else {'
+      '    $sourceTip = $baseCommit'
+      '  }'
+    )
+  }
+  else {
+    $execLines += @(
+      ''
+      '  # --- preserve mode: replay BaseRef..HEAD with the extracted paths held at their BaseRef state ---'
+      '  # Each commit''s tree is rebuilt in a temporary index (read-tree, then reset the paths to BaseRef)'
+      '  # and re-committed with its original author, committer, and message. Pure git: commits before'
+      '  # BaseRef keep their SHAs, unlike git filter-repo, which rewrites (and strips signatures from)'
+      '  # every commit that ever touched a path. Copy mode skips the rewrite; the source stays as is.'
+      '  if ($removeFromSource) {'
+      '    $revLines = @(& git -C $repoRoot rev-list --reverse --topo-order --parents "$baseCommit..$expectedHead")'
+      '    if ($LASTEXITCODE -ne 0) { throw "git rev-list $baseCommit..$expectedHead failed" }'
+      '    $identityNames = @(''GIT_AUTHOR_NAME'', ''GIT_AUTHOR_EMAIL'', ''GIT_AUTHOR_DATE'', ''GIT_COMMITTER_NAME'', ''GIT_COMMITTER_EMAIL'', ''GIT_COMMITTER_DATE'')'
+      '    foreach ($revLine in $revLines) {'
+      '      $ids = @($revLine.Trim() -split ''\s+'')'
+      '      $oldCommit = $ids[0]'
+      '      $oldParents = @($ids | Select-Object -Skip 1)'
+      '      $newParents = @($oldParents | ForEach-Object { if ($commitMap.Contains($_)) { $commitMap[$_] } else { $_ } })'
+      '      Set-GitSplitEnv ''GIT_INDEX_FILE'' $tempIndexPath'
+      '      try {'
+      '        & git -C $repoRoot read-tree $oldCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '        if ($LASTEXITCODE -ne 0) { throw "git read-tree $oldCommit failed" }'
+      '        & git -C $repoRoot reset -q $baseCommit -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '        if ($LASTEXITCODE -ne 0) { throw "git reset (extracted paths) for $oldCommit failed" }'
+      '        $tree = (& git -C $repoRoot write-tree).Trim()'
+      '        if ($LASTEXITCODE -ne 0 -or $tree -notmatch ''^[0-9a-f]{40}$'') { throw "git write-tree for $oldCommit failed" }'
+      '      }'
+      '      finally {'
+      '        Set-GitSplitEnv ''GIT_INDEX_FILE'' $savedGitEnv[''GIT_INDEX_FILE'']'
+      '      }'
+      '      if ($tree -eq (& git -C $repoRoot rev-parse "$oldCommit^{tree}").Trim() -and ($newParents -join '' '') -eq ($oldParents -join '' '')) {'
+      '        $commitMap[$oldCommit] = $oldCommit   # untouched and not re-parented: keep it, signature and all'
+      '        continue'
+      '      }'
+      '      if (-not $keepEmpty -and $newParents.Count -eq 1 -and $tree -eq (& git -C $repoRoot rev-parse "$($newParents[0])^{tree}").Trim()) {'
+      '        $commitMap[$oldCommit] = $newParents[0]   # it only changed the extracted paths: drop it'
+      '        $droppedCommits[$oldCommit] = $true'
+      '        continue'
+      '      }'
+      '      # Author/committer and message go through files, so their bytes never pass through the console encoding.'
+      '      & git -C $repoRoot log -1 "--pretty=format:%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd" --date=raw "--output=$identityPath" $oldCommit'
+      '      if ($LASTEXITCODE -ne 0) { throw "Failed to read the author and committer of $oldCommit" }'
+      '      $identity = @((Get-Content -LiteralPath $identityPath -Raw -Encoding UTF8) -split "`0")'
+      '      if ($identity.Count -ne 6) { throw "Unexpected author/committer format for $oldCommit" }'
+      '      & git -C $repoRoot log -1 --pretty=format:%B "--output=$messagePath" $oldCommit'
+      '      if ($LASTEXITCODE -ne 0) { throw "Failed to read the message of $oldCommit" }'
+      '      for ($i = 0; $i -lt $identityNames.Count; $i++) { Set-GitSplitEnv $identityNames[$i] $identity[$i] }'
+      '      try {'
+      '        $parentArgs = @($newParents | ForEach-Object { ''-p''; $_ })'
+      '        $newCommit = (& git -C $repoRoot commit-tree $tree @parentArgs -F $messagePath).Trim()'
+      '        if ($LASTEXITCODE -ne 0 -or $newCommit -notmatch ''^[0-9a-f]{40}$'') { throw "git commit-tree for $oldCommit failed" }'
+      '      }'
+      '      finally {'
+      '        foreach ($name in $identityNames) { Set-GitSplitEnv $name $savedGitEnv[$name] }'
+      '      }'
+      '      $commitMap[$oldCommit] = $newCommit'
+      '    }'
+      '    $sourceTip = $commitMap[$expectedHead]'
+      '  }'
+    )
+  }
+
+  # --- destination commit (both modes) ---
+  $execLines += @(
+    ''
+    '  # --- destination: $destBase + the extracted paths'' net change across BaseRef..HEAD ---'
+    '  # Applied as a 3-way patch in a temporary index, never as the paths'' whole HEAD snapshot: a'
+    '  # snapshot would also carry any edits made to the paths between an older -DestinationBase and'
+    '  # BaseRef. When stacked, $destBase is the rewritten source tip, whose paths sit at BaseRef.'
+    '  $destBase = if ($stacked) { $sourceTip } elseif ($destinationBaseCommit) { $destinationBaseCommit } else { $baseCommit }'
+    '  & git -C $repoRoot -c diff.noprefix=false -c diff.mnemonicPrefix=false diff --no-ext-diff --no-color --binary --full-index --no-renames "--output=$patchPath" $baseCommit $expectedHead -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) { throw "git diff (extracted paths) failed" }'
+    '  Set-GitSplitEnv ''GIT_INDEX_FILE'' $tempIndexPath'
+    '  try {'
+    '    & git -C $repoRoot read-tree $destBase 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) { throw "git read-tree (destination base) failed" }'
+    '    $applyOutput = @(& git -C $repoRoot apply --cached --3way $patchPath 2>&1 | ForEach-Object { "$_" })'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw ((@("The extracted paths'' changes in $baseCommit..$expectedHead do not apply cleanly onto $destBase. Choose a different -DestinationBase, or extract onto BaseRef:") + @($applyOutput | ForEach-Object { "  $_" })) -join [Environment]::NewLine)'
+    '    }'
+    '    $destTree = (& git -C $repoRoot write-tree).Trim()'
+    '    if ($LASTEXITCODE -ne 0 -or $destTree -notmatch ''^[0-9a-f]{40}$'') { throw "git write-tree (destination) failed" }'
+    '  }'
+    '  finally {'
+    '    Set-GitSplitEnv ''GIT_INDEX_FILE'' $savedGitEnv[''GIT_INDEX_FILE'']'
+    '  }'
+    '  if ($destTree -eq (& git -C $repoRoot rev-parse "$destBase^{tree}").Trim()) { throw "The extracted paths'' changes are already present on $destBase; the destination branch would be empty." }'
+    '  $destSha = (& git -C $repoRoot commit-tree $destTree -p $destBase -m $destinationMessage).Trim()'
+    '  if ($LASTEXITCODE -ne 0 -or $destSha -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to create the destination commit." }'
+  )
+
+  # --- ref updates (back in the main repo) ---
+  $execLines += @(
+    ''
+    '  # --- create the destination branch ---'
+    '  & git update-ref "refs/heads/$destinationBranch" $destSha 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) { throw "git update-ref (destination) failed" }'
+  )
+  if ($removeFromSource) {
+    $execLines += @(
+      ''
+      '  # --- rewrite the source branch to drop the extracted paths (destructive by default) ---'
+      '  & git update-ref "refs/heads/$expectedBranch" $sourceTip $expectedHead 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) { throw "git update-ref (source) failed" }'
+      '  & git @longPathGitArgs reset --hard "refs/heads/$expectedBranch" 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '  if ($LASTEXITCODE -ne 0) { throw "git reset --hard (source sync) failed" }'
+    )
+  }
+  else {
+    $execLines += @(
+      ''
+      '  # --- copy mode: source branch left untouched at $expectedHead ---'
+    )
+  }
+
+  # --- push (opt-in) ---
+  $execLines += @(
+    ''
+    '  if ($push) {'
+    '    & git push -u origin $destinationBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) { throw "git push (destination) failed" }'
+  )
+  if ($removeFromSource) {
+    $execLines += @(
+      '    if ($forcePushSource) {'
+      '      & git push --force-with-lease origin $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '      if ($LASTEXITCODE -ne 0) { throw "git push --force-with-lease (source) failed" }'
+      '    }'
+      '    else {'
+      '      Write-Warning "Source branch ''$expectedBranch'' was rewritten but -ForcePushSource was not set; source not pushed. Push manually: git push --force-with-lease origin $expectedBranch"'
+      '    }'
+    )
+  }
+  $execLines += @(
+    '  }'
+    ''
+    '  $succeeded = $true'
+    '  Write-Host "Split-ByPath complete."'
+    '  if ($removeFromSource) {'
+    '    Write-Host "  source:      $expectedBranch $expectedHead -> $sourceTip"'
+    '  }'
+    '  else {'
+    '    Write-Host "  source:      $expectedBranch $expectedHead (unchanged)"'
+    '  }'
+    '  Write-Host "  destination: $destinationBranch -> $destSha"'
+    '  if ($commitMap.Count -gt 0) {'
+    '    Write-Host "  rewritten commits (old -> new):"'
+    '    foreach ($entry in $commitMap.GetEnumerator()) {'
+    '      $newLabel = if ($droppedCommits.ContainsKey($entry.Key)) { "dropped (it only changed the extracted paths)" } else { $entry.Value }'
+    '      Write-Host "    $($entry.Key) -> $newLabel"'
+    '    }'
+    '  }'
+    '  elseif ($removeFromSource) {'
+    '    Write-Host "  every commit in $baseCommit..$expectedHead was squashed into $sourceTip"'
+    '  }'
+    '  Write-Host "  (History rewrite changes commit SHAs; old SHAs cited in review threads may become dangling on GitHub after force-push.)"'
+    '}'
+    'finally {'
+  )
+
+  $execLines += @(
+    '  foreach ($name in $gitEnvNames) { Set-GitSplitEnv $name $savedGitEnv[$name] }'
+    '  if ($scratchCreated -and (Test-Path -LiteralPath $scratchPath)) {'
+    '    Remove-Item -LiteralPath $scratchPath -Recurse -Force -ErrorAction SilentlyContinue'
+    '  }'
+    '  if ($worktreeCreated -and $worktreePath -and (Test-Path -LiteralPath $worktreePath)) {'
+    '    & git @longPathGitArgs worktree remove --force $worktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) { Write-Warning "Failed to remove worktree at ''$worktreePath''. Run: git worktree remove --force ''$worktreePath''" }'
+    '  }'
+    '  if (Test-Path -LiteralPath $disabledHooksPath) { Remove-Item -LiteralPath $disabledHooksPath -Recurse -Force -ErrorAction SilentlyContinue }'
+    '  if ($stashed) {'
+    '    $gitDir = (& git rev-parse --git-dir).Trim()'
+    '    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitDir)) { throw "Split-ByPath created a stash ''$stashName'' but failed to resolve the git directory for restoration." }'
+    '    if (-not [System.IO.Path]::IsPathRooted($gitDir)) { $gitDir = Join-Path $repoRoot $gitDir }'
+    '    $stashLines = @(& git stash list --format="%gd %s")'
+    '    if ($LASTEXITCODE -ne 0) { throw "Split-ByPath created a stash ''$stashName'' but failed to inspect the stash list for restoration." }'
+    '    $stashLine = $stashLines | Where-Object { $_ -like "*$stashName*" } | Select-Object -First 1'
+    '    if ([string]::IsNullOrWhiteSpace($stashLine)) { throw "Split-ByPath created a stash ''$stashName'' but could not find it for restoration." }'
+    '    $stashRef = ($stashLine -split ''\s+'', 2)[0]'
+    '    $inProgress = ('
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''rebase-apply'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''rebase-merge'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''MERGE_HEAD'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''CHERRY_PICK_HEAD'')) -or'
+    '      (Test-Path -LiteralPath (Join-Path $gitDir ''REVERT_HEAD''))'
+    '    )'
+    '    if ($inProgress) {'
+    '      Write-Error @('
+    '        "Split-ByPath created a stash (''$stashName'' -> $stashRef) but will NOT restore it because git reports an in-progress operation (merge/rebase/cherry-pick/revert)."'
+    '        ""'
+    '        "How to proceed:"'
+    '        "  1) Inspect state:            git status"'
+    '        "  2) Finish or abort operation: git rebase --continue | git rebase --abort | git merge --abort | git cherry-pick --abort | git revert --abort"'
+    '        "  3) Then restore your changes: git stash pop $stashRef"'
+    '        ""'
+    '        "How to undo the branch rewrite (if you used -RemoveFromSource):"'
+    '        "  - Find the pre-rewrite commit in reflog: git reflog"'
+    '        "  - Reset branch back to it:              git reset --hard <sha>"'
+    '      ) -join [Environment]::NewLine'
+    '    }'
+    '    else {'
+    '      & git stash pop $stashRef 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '      if ($LASTEXITCODE -ne 0) { throw "Failed to restore stash $stashRef created by Split-ByPath." }'
+    '    }'
+    '  }'
+    '}'
+    '$destinationBranch'
+  )
+
+  $steps += New-GitStep -Kind Comment -Lines @(
+    'Build the source (squash: in an isolated worktree; preserve: replayed in a temporary index) and the',
+    'destination (a patch applied in a temporary index), then update refs in the main repo.',
+    'Cleanup removes the temporary worktree and scratch files and restores any stash on all exit paths.'
+  )
+  $steps += New-GitStep -Kind Literal -Lines $execLines
+
+  return New-GitPlan -Name 'Split-ByPath' -Metadata @{
+    SourceBranch        = $currentBranch
+    SourceHead          = $currentHead
+    BaseCommit          = $baseCommit
+    DestinationBranch   = $DestinationBranch
+    Paths               = $normalizedPaths
+    Squash              = [bool]$squash
+    RemoveFromSource    = [bool]$removeFromSource
+    Stacked             = [bool]$stacked
+    DestinationBaseCommit = $destinationBaseCommit
+    Push                = [bool]$Push
+    AutoStash           = [bool]$AutoStash
+    OutputScriptCapable = $true
+  } -Steps $steps
+}
+
+function Split-ByPath {
+  <#
+  .SYNOPSIS
+    Extracts a set of paths' net change across BaseRef..HEAD into a separate branch.
+
+  .DESCRIPTION
+    Range-aware counterpart to Split-Commit / Move-Commit. Extracts the net change to -Path across the
+    BaseRef..HEAD range into -DestinationBranch, and (destructive by default) rewrites the current
+    branch to drop those paths' changes. See New-SplitByPathPlan for full semantics.
+
+  .PARAMETER Path
+    One or more repo-relative paths to extract (matched at current HEAD names).
+
+  .PARAMETER DestinationBranch
+    The new branch to receive the extracted paths' net change. Must not already exist (locally or on
+    origin); a split creates a new PR branch.
+
+  .PARAMETER BaseRef
+    Range base. Defaults to merge-base(HEAD, origin/HEAD). Must be an ancestor of HEAD.
+
+  .PARAMETER DestinationBase
+    Where to root the destination. Default: stacked on the rewritten source tip (when -RemoveFromSource)
+    or flat on BaseRef (copy mode). Pass an explicit ref for a flat dest rooted elsewhere.
+
+  .PARAMETER Squash
+    Default $true: collapse the source to one squashed commit (pure git). -Squash:$false preserves the
+    source commit structure, replaying each commit with the paths held at their BaseRef state.
+
+  .PARAMETER RemoveFromSource
+    Default $true (DESTRUCTIVE): rewrite the source branch to drop the extracted paths, like `mv`. Pass
+    -RemoveFromSource:$false for a non-destructive copy (source untouched).
+
+  .PARAMETER Push
+    Push the destination branch (and source, with -ForcePushSource, if rewritten).
+
+  .PARAMETER ForcePushSource
+    Force-push the rewritten source branch with --force-with-lease.
+
+  .PARAMETER AutoStash
+    Stash uncommitted changes before the split and restore them after.
+
+  .PARAMETER KeepEmpty
+    Preserve mode only: keep commits that become empty once the paths' changes are removed.
+
+  .PARAMETER OutputScriptPath
+    Write a reviewable script instead of executing immediately.
+
+  .NOTES
+    Destructive by default (-RemoveFromSource). This is intentional and mirrors `mv`; the opt-out is
+    -RemoveFromSource:$false. The emitted scripts are the review surface. See New-SplitByPathPlan.
+  .EXAMPLE
+    Split-ByPath -Path '.github/workflows/ci.yml' -DestinationBranch 'ci-split'
+    # Extracts ci.yml's net change into ci-split (stacked on the rewritten source), removes it from the current branch.
+
+  .EXAMPLE
+    Split-ByPath -Path 'src/a.ts','src/b.ts' -DestinationBranch 'feat-ts' -DestinationBase 'main' -RemoveFromSource:$false
+    # Copy mode: source untouched, flat dest on main containing the two files' net change.
+  #>
+  [CmdletBinding(SupportsShouldProcess = $true)]
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory = $true, Position = 0)]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$Path,
+
+    [Parameter(Mandatory = $true, Position = 1)]
+    [ValidateNotNullOrEmpty()]
+    [string]$DestinationBranch,
+
+    [Parameter()]
+    [string]$BaseRef,
+
+    [Parameter()]
+    [string]$DestinationBase,
+
+    [Parameter()]
+    [switch]$Squash,
+
+    [Parameter()]
+    [switch]$RemoveFromSource,
+
+    [Parameter()]
+    [string]$SourceMessage,
+
+    [Parameter()]
+    [string]$DestinationMessage,
+
+    [Parameter()]
+    [switch]$Push,
+
+    [Parameter()]
+    [switch]$ForcePushSource,
+
+    [Parameter()]
+    [switch]$AutoStash,
+
+    [Parameter()]
+    [switch]$KeepEmpty,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$OutputScriptPath
+  )
+
+  # -Squash and -RemoveFromSource default to $true (destructive squash is the default). A PowerShell
+  # [switch] defaults to $false and is only "present" in $PSBoundParameters when explicitly passed, so
+  # the plan builder keys its $true default off $PSBoundParameters.ContainsKey. Passing these switches
+  # unconditionally here (as -Squash:$Squash) would always make them "present" and invert the default.
+  # Only forward them when the caller actually set them.
+  $planParams = @{
+    Path              = $Path
+    DestinationBranch = $DestinationBranch
+    BaseRef           = $BaseRef
+    DestinationBase   = $DestinationBase
+    SourceMessage     = $SourceMessage
+    DestinationMessage = $DestinationMessage
+    Push              = $Push
+    ForcePushSource   = $ForcePushSource
+    AutoStash         = $AutoStash
+    KeepEmpty         = $KeepEmpty
+  }
+  if ($PSBoundParameters.ContainsKey('Squash')) { $planParams['Squash'] = [bool]$Squash }
+  if ($PSBoundParameters.ContainsKey('RemoveFromSource')) { $planParams['RemoveFromSource'] = [bool]$RemoveFromSource }
+
+  $plan = New-SplitByPathPlan @planParams
+
+  if ($OutputScriptPath) {
+    if ($PSCmdlet.ShouldProcess($OutputScriptPath, 'Write Split-ByPath execution script')) {
+      return Write-GitScript -Plan $plan -Path $OutputScriptPath
+    }
+    return
+  }
+
+  $action = if ($plan.Metadata.RemoveFromSource) {
+    "Split paths into $DestinationBranch and remove them from $($plan.Metadata.SourceBranch)"
+  }
+  else {
+    "Copy paths into $DestinationBranch (source unchanged)"
+  }
+
+  if ($PSCmdlet.ShouldProcess($DestinationBranch, $action)) {
+    return Invoke-GitPlan -Plan $plan
+  }
+}
+
 if ($env:CI) {
   Write-Host "Exporting all module members for CI environment."
   Export-ModuleMember *
@@ -4620,6 +5354,7 @@ else {
     'Add-Commit'
     'Remove-Commit'
     'Move-Commit'
+    'Split-ByPath'
     'Set-CommitOrder'
     'Invoke-GitSplitAbsorb'
     'Get-CommitMessageFromChanges'
