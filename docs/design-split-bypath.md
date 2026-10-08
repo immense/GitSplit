@@ -33,7 +33,6 @@ Split-ByPath
   -Path <string[]>                      # paths to extract (repo-relative; matched at current HEAD names)
   -DestinationBranch <string>           # mandatory
   [-BaseRef <string>]                   # default: merge-base(HEAD, origin/HEAD)
-  [-CreateDestinationBranch]            # create dest; requires DestinationBase (or default)
   [-DestinationBase <string>]           # default: see §4 (stacked vs flat)
   [-Squash]                             # default ON: squash source via soft-reset (see §5)
   [-RemoveFromSource]                   # default ON — a split removes the paths from source
@@ -98,7 +97,7 @@ differ in what they do to the **source branch's commit structure**.
 | Mode | Source after | Destination | Mechanical tool | SHAs changed |
 |---|---|---|---|---|
 | **`-Squash`** (default) | ONE squashed commit (`BaseRef` + everything-except-paths) | ONE commit (only paths' net change), stacked on source tip | pure git: `reset --soft` + commit-from-index | source: all of `BaseRef..HEAD` collapse to 1 |
-| **preserve** (`-Squash:$false`) | original commits preserved, paths excised from each | ONE commit (only paths' net change) | `git filter-repo --invert-paths` in a temp clone, fetch-back | source: every commit from first-touch onward (cascade) |
+| **preserve** (`-Squash:$false`) | original commits preserved, each with the paths held at their `BaseRef` state | ONE commit (only paths' net change) | pure git: replay `BaseRef..HEAD` in a temporary index (`read-tree`, reset the paths to `BaseRef`, `commit-tree`) | source: every commit from first-touch onward (cascade); earlier commits keep their SHAs |
 
 `-Squash` is the mode that was proven by hand on immybot #9431 and is the
 **default**: it is pure git (no external dependency), fast, and matches the "I
@@ -120,10 +119,19 @@ extracted file).
   trunk. Use when the extracted change is genuinely independent of the source
   branch.
 
-`-CreateDestinationBranch` mirrors `Move-Commit`: required when the destination
-does not already exist; throws with delete-hints if it exists and
-`-CreateDestinationBranch` is set (consistency with `New-MoveCommitPlan`'s
-existing guard).
+The destination branch must not exist yet, locally or on `origin`: a split always
+creates a new branch, so there is no `-CreateDestinationBranch` switch. An
+existing ref throws with delete-hints.
+
+**How the destination commit is built (both modes).** The paths' net change,
+`git diff BaseRef HEAD -- <paths>`, is applied as a 3-way patch onto the
+destination base in a temporary index (`read-tree <base>`, `apply --cached
+--3way`, `write-tree`, `commit-tree -p <base>`). It is never the paths' whole
+`HEAD` snapshot: with an explicit `-DestinationBase` older than `BaseRef`, a
+snapshot would also carry every edit made to the paths between the two. If the
+change does not apply cleanly (for example, the destination base lacks a file the
+range modifies), the plan throws before any ref moves and shows git's conflict
+output.
 
 ## 5. `-Squash` implementation — commit-from-index (pure git, no deps)
 
@@ -197,56 +205,33 @@ a copy). The destination branch ref is created at its commit. Push is opt-in
 (`-Push`, `-ForcePushSource`), emitting `git push --force-with-lease` for the
 rewritten source — matching `Move-Commit`'s push discipline.
 
-## 6. Preserve implementation (`git filter-repo`)
+## 6. Preserve implementation (pure-git replay)
 
-Excising paths from every commit in a range while **preserving commit structure**
-is a per-commit history rewrite — the operation `git filter-repo` exists for.
-Native porcelain (`rebase --onto` with `exec git rm`, or a cherry-pick replay)
-is fiddly with adds/deletes/renames and silently produces empty commits; filter-repo
-handles all of those correctly and prunes empties. This is the one mode where an
-external tool earns its place.
+Preserve mode replays `BaseRef..HEAD` (`git rev-list --reverse --topo-order
+--parents`) and rebuilds each commit's tree in a temporary index:
 
-**Dependency & isolation constraints (the non-obvious parts):**
+1. `read-tree <commit>` loads the original tree.
+2. `reset -q <BaseRef> -- <paths>` puts each extracted path back to its `BaseRef`
+   state: restored when it existed there, removed when it did not.
+3. `write-tree` produces the new tree, and `commit-tree` re-commits it on the
+   rewritten parents with the original author, committer, and message. Those are
+   read through files (`git log --output`), so their bytes never pass through the
+   console encoding.
 
-1. **`filter-repo` refuses non-fresh-clone repos.** It rejects a repo that isn't a
-   freshly-made clone (guard against corrupting a working repo). A `git worktree`
-   shares the main repo's object store, so it is *not* a fresh clone and will be
-   rejected. Therefore preserve mode cannot reuse GitSplit's temp-worktree
-   pattern. Instead: `git clone --local --no-hardlinks <repo> <temp>` of just the
-   source branch into `New-GitSplitTempDirectoryPath`, run filter-repo there with
-   `--force`, then **fetch the rewritten tip back** into the main repo and
-   force-update the source ref. The `--no-hardlinks` matters: a hardlinked clone
-   shares objects, and filter-repo's rewrite + GC must not touch the source repo's
-   object store.
-2. **`filter-repo` strips the `origin` remote** (safety: prevent accidental push of
-   rewritten history). This is fine here because we operate in the temp clone and
-   only fetch-back a branch — we never push from the clone.
-3. **Command:**
-   ```bash
-   git clone --local --no-hardlinks "$repoRoot" "$tempClone"
-   cd "$tempClone"
-   git filter-repo --force --invert-paths \
-     --path "$p1" --path "$p2" \
-     --prune-empty $( $KeepEmpty ? 'off' : 'auto' )
-   # fetch the rewritten source branch back into the main repo
-   cd "$repoRoot"
-   git fetch "$tempClone" "$sourceBranch" --force
-   git update-ref "refs/heads/$sourceBranch" FETCH_HEAD
-   ```
-4. **Destination (preserve, both stacked & flat):** built commit-from-index off
-   `DestinationBase` — `git checkout "$DestinationBase"`, then apply paths' net
-   change. Because the dest is a single new commit (not a per-commit rewrite), the
-   net change is applied from a `git diff BaseRef..HEAD -- <paths>` patch OR by
-   the same index technique: in a temp worktree at `HEAD`, `git reset --soft
-   BaseRef`, `git commit -- <paths>` to capture the net change, then
-   `git branch -f` the dest at that commit reparented onto `DestinationBase` via
-   `git cherry-pick`. Prefer the index technique for the same deletion-correctness
-   reason as §5.1.
+Commits whose tree and parents come out unchanged keep their SHA (and any
+signature). Commits that only changed the extracted paths come out identical to
+their parent and are dropped unless `-KeepEmpty` is set. The destination commit
+is then built exactly as in §4.
 
-**`filter-repo` not installed:** detect at plan-build time
-(`Get-Command git-filter-repo`), throw with an install hint, and document the
-native cherry-pick-replay as a future dependency-free fallback (see §10). Do
-**not** silently fall back — fail loud (maintainer's standing rule).
+**Why not `git filter-repo`.** The first cut ran `filter-repo --invert-paths` in a
+fresh `--no-hardlinks` clone and fetched the result back. That had two
+correctness problems. `--invert-paths` deletes the paths from *every* commit, so a
+file that already existed at `BaseRef` vanished from the source instead of going
+back to its `BaseRef` content. And filter-repo rewrites all history that touched
+the paths, including commits before `BaseRef` (stripping their signatures), so the
+source stopped sharing history with its trunk. The replay touches only
+`BaseRef..HEAD`, needs no clone, and drops the external dependency, so preserve
+mode also runs in CI.
 
 ## 7. Edge cases
 
@@ -270,19 +255,18 @@ values) and either handled or thrown on — never silently mishandled.
   reconstruct-via-checkout technique, which could not express a deletion.
 - **Path unchanged in the range but matched by filter:** contributes nothing to
   the net diff; harmless (collapses to a no-op for that path in the index commit;
-  filter-repo in preserve mode simply has nothing to remove from those commits).
+  preserve mode leaves those commits as they were).
   The §7.1 "no changes at all" guard still fires if *every* matched path is unchanged.
 - **Path renamed within the range:** paths are matched at **HEAD names**. A path
   matched by its old name won't follow the rename. Document this limitation;
-  recommend selecting the HEAD name. filter-repo follows renames for its own
-  path filters, so preserve mode is more robust here — note the asymmetry.
+  recommend selecting the HEAD name. Both modes share this limitation.
 
 ### 7.3 Empty-commit pruning (preserve only)
-- filter-repo `--prune-empty=auto` (default) drops commits that become empty after
-  excision. This **changes the commit count**, which surprises anyone diffing
-  before/after. Default to `auto`; `-KeepEmpty` passes `--prune-empty=off` to
-  preserve empty commits as markers. Document that SHA count may shrink. (Squash
-  mode is unaffected — it collapses to one commit by design.)
+- The replay drops a single-parent commit whose rebuilt tree equals its new
+  parent's, meaning it only changed the extracted paths. This **changes the
+  commit count**, which surprises anyone diffing before/after, so the completion
+  output lists each dropped commit. `-KeepEmpty` keeps such commits as empty
+  markers. (Squash mode is unaffected — it collapses to one commit by design.)
 
 ### 7.4 History-rewrite consequences (both modes)
 - **SHA cascade:** any mode that rewrites the source changes SHAs from the first
@@ -292,12 +276,13 @@ values) and either handled or thrown on — never silently mishandled.
   hash of its tree + parent + metadata. Document prominently.
 - **Orphaned review-thread citations:** if the source branch has an open PR, SHAs
   cited in resolved review threads become dangling on GitHub after force-push
-  (the old commits are unreachable and eventually GC'd remotely). Recoverable
-  *locally* via filter-repo's `.git/filter-repo/` old→new map, but not on GitHub.
+  (the old commits are unreachable and eventually GC'd remotely). The plan prints
+  the old→new map on completion, but GitHub cannot follow it.
   This happened on immybot #9431 (c6a15aa8be, 44e6f07a6c, etc. went dark after the
   squash). Mitigation: `-OutputScriptPath` lets the user review the exact rewrite
-  before running it; the plan should emit the old→new SHA map to the console on
-  completion so the user can update citations. **No automatic PR-comment rewriting**
+  before running it; the plan emits the old→new SHA map to the console on
+  completion (preserve: one line per rewritten or dropped commit; squash: the old
+  and new tip) so the user can update citations. **No automatic PR-comment rewriting**
   — out of scope (mechanical git only).
 - **Force-push required:** rewritten source is non-fast-forward; emit
   `git push --force-with-lease` only when `-Push` + `-ForcePushSource` are set
@@ -314,16 +299,10 @@ values) and either handled or thrown on — never silently mishandled.
   $expectedHead` at script start, *before* the squash rewrite — exactly
   `Move-Commit`'s pattern. No special handling for the mid-script HEAD rewrite is
   needed; the guard has already passed by the time `git reset --soft` runs.
-- **Destination branch already exists:** reuse `New-MoveCommitPlan`'s
-  `Get-MoveCommitMissingDestinationBranchMessage`-style throw with delete-hints
-  when `-CreateDestinationBranch` is set against an existing ref.
+- **Destination branch already exists:** throw with delete-hints, whether the
+  ref exists locally or on `origin` (a split always creates the destination).
 
-### 7.6 filter-repo-specific (preserve only)
-- **Not installed:** `Get-Command git-filter-repo` at plan-build; throw with
-  install hint (`brew install git-filter-repo` / `pip install git-filter-repo`).
-- **Fresh-clone friction:** the `--local --no-hardlinks` temp clone + fetch-back
-  is mandatory (§6.1); a worktree will be rejected by filter-repo. Tests must
-  cover the clone→filter→fetch→update-ref round-trip.
+### 7.6 Trunk default
 - **Trunk default:** `BaseRef` defaults to `merge-base(HEAD, origin/HEAD)`
   (resolve `origin/HEAD` via `git symbolic-ref refs/remotes/origin/HEAD`),
   matching the "split a branch off the default branch" intent. Overridable. If
@@ -347,7 +326,6 @@ function New-SplitByPathPlan {
     [Parameter(Mandatory)] [string[]] $Path,
     [Parameter(Mandatory)] [string]   $DestinationBranch,
     [Parameter()]          [string]   $BaseRef,          # default: merge-base(HEAD, origin/HEAD)
-    [Parameter()]          [switch]   $CreateDestinationBranch,
     [Parameter()]          [string]   $DestinationBase,  # default: rewritten source tip (stacked)
     [Parameter()]          [switch]   $Squash,           # default $true
     [Parameter()]          [switch]   $RemoveFromSource, # default $true (destructive by default)
@@ -361,11 +339,11 @@ function New-SplitByPathPlan {
   # 1. discovery: resolve HEAD/BaseRef, run §7 guards, choose commit order
   #    from DestinationBase (flat: paths-first; stacked: paths-last).
   # 2. choose impl: $Squash -> §5 commit-from-index literal steps;
-  #    else -> §6 clone+filter-repo+fetch-back.
+  #    else -> §6 pure-git replay in a temporary index.
   # 3. emit $expected* frozen values + runtime drift guards (copied from
   #    New-MoveCommitPlan; check HEAD == expectedHead at script start, before
   #    the squash rewrite).
-  # 4. temp worktree (squash) / temp clone (preserve) setup + finally-cleanup.
+  # 4. temp worktree (squash) + scratch files (both) setup + finally-cleanup.
   # 5. ref updates: update source (force, if RemoveFromSource) + create dest.
   #    (destructive-by-default — see §2 review-bot note.)
   # 6. push (opt-in): git push --force-with-lease for source; git push for dest.
@@ -446,28 +424,21 @@ Mirror the existing `Move-Commit` / `Split-Commit` Pester cases. Minimum matrix:
 | RemoveFromSource:$false (copy) | squash | source untouched (still at HEAD); dest = paths' net change |
 | no changes to paths | squash | throws (§7.1) |
 | BaseRef==HEAD | squash | throws |
-| dest branch exists + CreateDestinationBranch | squash | throws with delete-hints |
+| dest branch exists | squash | throws with delete-hints |
+| older DestinationBase | squash | dest = DestinationBase + only the `BaseRef..HEAD` path change (no edits from before `BaseRef`) |
+| change doesn't apply onto DestinationBase | squash | throws "do not apply cleanly"; no ref moves |
 | unclean tree, no AutoStash | squash | throws listing files |
 | unclean tree, AutoStash | squash | stashes, splits, restores |
 | OutputScriptPath | squash | script renders, is re-runnable, drift guards fire when HEAD changes between generate and execute |
 | destructive-by-default | squash | without `-RemoveFromSource:$false`, source ref moves (rewritten); documented as intended |
-| preserve: filter-repo absent | preserve | throws with install hint |
-| preserve: structure retained | preserve | source commit count preserved (minus pruned empties); paths gone from each commit tree |
-| preserve: KeepEmpty | preserve | empty commits kept (`--prune-empty=off`) |
-| preserve: path deleted in range | preserve | filter-repo restores the file in earlier commits; dest records deletion |
+| preserve: structure retained | preserve | only `BaseRef..HEAD` rewritten; commit count preserved (minus dropped commits); paths at their `BaseRef` state in each commit |
+| preserve: KeepEmpty | preserve | commits that only changed the paths are kept as empty markers |
+| preserve: untouched / path-only commits | preserve | untouched commits keep their SHA; path-only commits are dropped and listed |
 
-filter-repo cases are skipped (not failed) if `git-filter-repo` isn't on PATH in
-CI — gate with a `BeforeAll` `Get-Command` check so the squash suite still runs
-green on runners without filter-repo.
+Preserve mode needs nothing beyond git, so its cases run everywhere, CI included.
 
 ## 10. Future / out of scope
 
-- **Dependency-free preserve mode:** a native cherry-pick-replay (`git cherry-pick
-  -n <c>; git restore --staged --worktree -- <paths>; git checkout <c>^ -- <paths>;
-  commit -C <c> or skip if empty`) would remove the filter-repo dependency. It's
-  more code and slower, and the add/delete/rename edge cases are exactly what
-  filter-repo gets right for free. Recommended as a later `-PreserveEngine Native`
-  option, not the first cut.
 - **Reuse Move-Commit core:** refactor `New-MoveCommitPlan` into core + guard
   wrapper (§8.2), so Split-ByPath (and `Remove-Commit`/`Set-CommitOrder`) splice
   the shared core. Follow-up PR.
@@ -491,9 +462,9 @@ green on runners without filter-repo.
 3. **Commit-from-index, not reconstruct-via-checkout:** the squash mode commits
    paths from the index after `reset --soft`, eliminating the deletion edge case
    (former §7.2). This supersedes the earlier reconstruct technique.
-4. **filter-repo dependency:** accepted for preserve mode in the first cut; the
-   native engine (§10) is a later option. filter-repo absent → fail loud with an
-   install hint (preserve mode unavailable, squash mode unaffected).
+4. **No filter-repo dependency:** preserve mode replays `BaseRef..HEAD` in pure
+   git (§6). The first cut's `filter-repo --invert-paths` engine deleted files
+   that existed at `BaseRef` and rewrote history before it.
 5. **Trunk default:** `merge-base(HEAD, origin/HEAD)`, overridable via `-BaseRef`.
    If `origin/HEAD` is unset, require explicit `-BaseRef`.
 6. **No `-TipRef`:** the tip is always the current branch HEAD. Dropped from the

@@ -4635,14 +4635,20 @@ function New-SplitByPathPlan {
         the paths and the remainder from the index. Committing from the index (not reconstructing via
         `git checkout`) correctly handles adds, modifies, AND deletions uniformly -- no git rm
         special-case. The source collapses to ONE squashed commit.
-      - -Squash:$false (preserve): `git filter-repo --invert-paths` in a temp clone, fetch-back. Keeps
-        the source's commit structure with the paths excised from each commit. Requires git-filter-repo.
+      - -Squash:$false (preserve): replays each BaseRef..HEAD commit with the paths held at their
+        BaseRef state (pure git: a temporary index plus commit-tree). Keeps the source's commit
+        structure minus the paths' changes; commits before BaseRef keep their SHAs.
 
     Stacked vs flat destination (default stacked when destructive):
       - Stacked (default, -RemoveFromSource): destination parented on the rewritten source tip; its PR
         base is the source branch so the diff shows only the extracted paths.
       - Flat (-DestinationBase <ref>, or copy mode): destination parented on -DestinationBase (or
         BaseRef) as an independent sibling.
+
+    The destination commit applies the paths' net BaseRef..HEAD change to its parent as a 3-way patch,
+    never the paths' whole HEAD snapshot, which would also carry edits made between an older
+    -DestinationBase and BaseRef. If the change does not apply cleanly, the plan throws before any ref
+    moves.
 
     This builder returns a New-GitPlan of Comment/Literal steps (the same plan/execute model as
     Move-Commit), so the plan both renders to a reviewable script (Write-GitScript) and executes
@@ -4651,8 +4657,9 @@ function New-SplitByPathPlan {
   .NOTES
     History rewrite changes commit SHAs (squash: the whole range collapses to one new SHA; preserve:
     every commit from first-path-touch onward is re-hashed). SHAs cited in PR review threads become
-    dangling on GitHub after force-push. The plan prints the old->new mapping on completion; automatic
-    review-thread SHA migration is out of scope.
+    dangling on GitHub after force-push. On completion the plan prints the source branch's old and new
+    tip and, in preserve mode, each rewritten commit's old -> new SHA (or that it was dropped);
+    automatic review-thread SHA migration is out of scope.
   #>
   [CmdletBinding()]
   param(
@@ -4781,13 +4788,6 @@ function New-SplitByPathPlan {
     }
   }
 
-  # --- preserve mode requires git-filter-repo ---
-  if (-not $squash) {
-    if (-not (Get-Command git-filter-repo -ErrorAction SilentlyContinue)) {
-      throw "Split-ByPath preserve mode (-Squash:`$false) requires git-filter-repo, which was not found on PATH. Install with: brew install git-filter-repo  (or: pip install git-filter-repo)"
-    }
-  }
-
   # --- defaults for commit messages ---
   if ([string]::IsNullOrWhiteSpace($SourceMessage)) {
     $SourceMessage = "Split: extract paths into $DestinationBranch"
@@ -4800,7 +4800,7 @@ function New-SplitByPathPlan {
 
   $plannedWorktreePath = New-GitSplitWorktreePath -RepoRoot $repoRoot
   $plannedStashName = New-GitSplitStashName -Operation 'split-bypath'
-  $plannedClonePath = if (-not $squash) { New-GitSplitTempDirectoryPath -Prefix 'gitsplit-splitbypath-clone' } else { $null }
+  $plannedScratchPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-splitbypath'
   $plannedDisabledHooksPath = New-GitSplitTempDirectoryPath -Prefix 'gitsplit-hooks'
 
   # ===========================================================================
@@ -4830,12 +4830,12 @@ function New-SplitByPathPlan {
     '$keepEmpty = ' + $(if ($KeepEmpty) { '$true' } else { '$false' })
     '$plannedStashName = ' + (ConvertTo-PowerShellStringLiteral $plannedStashName)
     '$worktreePath = ' + (ConvertTo-PowerShellStringLiteral $plannedWorktreePath)
-    '$clonePath = ' + (ConvertTo-PowerShellStringLiteral $plannedClonePath)
+    '$scratchPath = ' + (ConvertTo-PowerShellStringLiteral $plannedScratchPath)
     '$disabledHooksPath = ' + (ConvertTo-PowerShellStringLiteral $plannedDisabledHooksPath)
     '$stashed = $false'
     '$stashName = $null'
     '$worktreeCreated = $false'
-    '$cloneCreated = $false'
+    '$scratchCreated = $false'
     '$succeeded = $false'
   )
   $frozenLines += ConvertTo-PowerShellHereStringLines -AssignmentPrefix '$sourceMessage = ' -Value $SourceMessage
@@ -4899,13 +4899,34 @@ function New-SplitByPathPlan {
     'if ($env:OS -eq ''Windows_NT'') { $longPathGitArgs = @(''-c'', ''core.longpaths=true'') }'
     '$sourceTip = $null'
     '$destSha = $null'
+    '# old -> new SHA of every rewritten source commit (preserve mode), printed on completion.'
+    '$commitMap = [ordered]@{}'
+    '$droppedCommits = @{}'
+    '# The temporary-index steps set these variables; the finally block restores the caller''s values.'
+    '$gitEnvNames = @(''GIT_INDEX_FILE'', ''GIT_AUTHOR_NAME'', ''GIT_AUTHOR_EMAIL'', ''GIT_AUTHOR_DATE'', ''GIT_COMMITTER_NAME'', ''GIT_COMMITTER_EMAIL'', ''GIT_COMMITTER_DATE'')'
+    '$savedGitEnv = @{}'
+    'foreach ($name in $gitEnvNames) { $savedGitEnv[$name] = [Environment]::GetEnvironmentVariable($name) }'
+    '# Removes the variable for $null: [Environment]::SetEnvironmentVariable would get "" from PowerShell'
+    '# for a $null value and leave an empty variable behind, which breaks git (e.g. GIT_INDEX_FILE="").'
+    'function Set-GitSplitEnv([string]$Name, $Value) {'
+    '  if ($null -eq $Value) { Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue }'
+    '  else { Set-Item -LiteralPath "Env:$Name" -Value $Value }'
+    '}'
+    'if (Test-Path -LiteralPath $scratchPath) { throw "Planned scratch path ''$scratchPath'' already exists." }'
+    'try {'
+    '  New-Item -Path $scratchPath -ItemType Directory -Force | Out-Null'
+    '  $scratchCreated = $true'
+    '  $tempIndexPath = Join-Path $scratchPath ''index'''
+    '  $patchPath = Join-Path $scratchPath ''paths.patch'''
+    '  $messagePath = Join-Path $scratchPath ''message.txt'''
+    '  $identityPath = Join-Path $scratchPath ''identity.txt'''
   )
 
   if ($squash) {
     $execLines += @(
-      '# --- squash mode: pure git, commit-from-index in a temp worktree ---'
-      'if (Test-Path -LiteralPath $worktreePath) { throw "Planned worktree path ''$worktreePath'' already exists." }'
-      'try {'
+      ''
+      '  # --- squash mode: the source collapses to ONE commit, built from the index in a temp worktree ---'
+      '  if (Test-Path -LiteralPath $worktreePath) { throw "Planned worktree path ''$worktreePath'' already exists." }'
       '  if (-not (Test-Path -LiteralPath $disabledHooksPath)) { New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null }'
       '  & git @longPathGitArgs worktree add --detach $worktreePath $expectedHead 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
       '  if ($LASTEXITCODE -ne 0) { throw "git worktree add --detach failed" }'
@@ -4932,81 +4953,97 @@ function New-SplitByPathPlan {
       '  else {'
       '    $sourceTip = $baseCommit'
       '  }'
-      ''
-      '  if ($stacked) {'
-      '    # Stacked: dest parented on the rewritten source tip. Stage the extract paths and commit on top.'
-      '    & git @longPathGitArgs -C $worktreePath add -A -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git add -A -- <paths> failed" }'
-      '    & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" commit -m $destinationMessage --quiet 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git commit (destination) failed" }'
-      '    $destSha = (& git -C $worktreePath rev-parse HEAD).Trim()'
-      '  }'
-      '  else {'
-      '    # Flat: dest parented on $destinationBaseCommit (== $baseCommit unless -DestinationBase given).'
-      '    # Build the destination commit directly on $destBase via commit-from-index: soft-reset HEAD to'
-      '    # $destBase (index keeps the staged tree), stage the extract paths from the working tree (which'
-      '    # still holds the HEAD versions), and commit only those paths. This avoids cherry-pick'
-      '    # reparenting, which would conflict (modify/delete) whenever $destBase lacks an extracted path'
-      '    # that existed at the base -- e.g. an explicit destination base, where the path is an add.'
-      '    $destBase = if ($destinationBaseCommit) { $destinationBaseCommit } else { $baseCommit }'
-      '    & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" reset --soft $destBase 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git reset --soft (flat) failed" }'
-      '    & git @longPathGitArgs -C $worktreePath add -A -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git add -A -- <paths> (flat) failed" }'
-      '    & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" commit -m $destinationMessage --quiet -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git commit (paths) failed" }'
-      '    $destSha = (& git -C $worktreePath rev-parse HEAD).Trim()'
-      '  }'
-      '  if ($LASTEXITCODE -ne 0 -or $destSha -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to resolve destination commit." }'
     )
   }
   else {
-    # preserve mode: git filter-repo in a fresh clone, fetch-back
     $execLines += @(
-      '# --- preserve mode: git filter-repo in a fresh --no-hardlinks clone, then fetch-back ---'
-      '# The source rewrite (filter-repo) only runs in destructive mode; copy mode skips it (sourceTip unused).'
-      'if (Test-Path -LiteralPath $clonePath) { throw "Planned clone path ''$clonePath'' already exists." }'
-      'try {'
-      '  if ($removeFromSource) {'
-      '    & git clone --local --no-hardlinks $expectedRepoRoot $clonePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git clone --local --no-hardlinks failed" }'
-      '    $cloneCreated = $true'
-      '    & git -C $clonePath checkout -q $expectedBranch 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git checkout $expectedBranch in clone failed" }'
-      '    $pruneArg = if ($keepEmpty) { "off" } else { "auto" }'
-      '    $filterArgs = @("--force", "--invert-paths", "--prune-empty=$pruneArg")'
-      '    foreach ($p in $paths) { $filterArgs += @("--path", $p) }'
-      '    & git -C $clonePath filter-repo @filterArgs 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git filter-repo failed" }'
-      '    & git fetch $clonePath $expectedBranch --force 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '    if ($LASTEXITCODE -ne 0) { throw "git fetch (rewrite back) failed" }'
-      '    $sourceTip = (& git rev-parse FETCH_HEAD).Trim()'
-      '    if ($LASTEXITCODE -ne 0 -or $sourceTip -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to resolve rewritten source tip." }'
-      '  }'
       ''
-      '  # Build the destination commit (paths net change) directly on $destBase via commit-from-index:'
-      '  # soft-reset HEAD to $destBase (index keeps the expectedHead tree), stage the extract paths from'
-      '  # the working tree, and commit only those paths. The commit''s parent IS $destBase, so no'
-      '  # cherry-pick reparenting is needed -- which would otherwise conflict (modify/delete) whenever'
-      '  # $destBase lacks an extracted path that existed at the base. In stacked destructive mode'
-      '  # $destBase is the filter-repo-rewritten $sourceTip (paths already excised); the destination'
-      '  # reapplies the path net-change on top of it, so the PR diff shows only the extracted paths.'
-      '  if (Test-Path -LiteralPath $worktreePath) { throw "Planned worktree path ''$worktreePath'' already exists." }'
-      '  if (-not (Test-Path -LiteralPath $disabledHooksPath)) { New-Item -Path $disabledHooksPath -ItemType Directory -Force | Out-Null }'
-      '  & git @longPathGitArgs worktree add --detach $worktreePath $expectedHead 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '  if ($LASTEXITCODE -ne 0) { throw "git worktree add --detach (dest) failed" }'
-      '  $worktreeCreated = $true'
-      '  $destBase = if ($stacked) { $sourceTip } elseif ($destinationBaseCommit) { $destinationBaseCommit } else { $baseCommit }'
-      '  & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" reset --soft $destBase 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '  if ($LASTEXITCODE -ne 0) { throw "git reset --soft (dest) failed" }'
-      '  & git @longPathGitArgs -C $worktreePath add -A -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '  if ($LASTEXITCODE -ne 0) { throw "git add -A -- <paths> (dest) failed" }'
-      '  & git @longPathGitArgs -C $worktreePath -c "core.hooksPath=$disabledHooksPath" commit -m $destinationMessage --quiet -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
-      '  if ($LASTEXITCODE -ne 0) { throw "git commit (dest paths) failed" }'
-      '  $destSha = (& git -C $worktreePath rev-parse HEAD).Trim()'
-      '  if ($LASTEXITCODE -ne 0 -or $destSha -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to resolve destination commit." }'
+      '  # --- preserve mode: replay BaseRef..HEAD with the extracted paths held at their BaseRef state ---'
+      '  # Each commit''s tree is rebuilt in a temporary index (read-tree, then reset the paths to BaseRef)'
+      '  # and re-committed with its original author, committer, and message. Pure git: commits before'
+      '  # BaseRef keep their SHAs, unlike git filter-repo, which rewrites (and strips signatures from)'
+      '  # every commit that ever touched a path. Copy mode skips the rewrite; the source stays as is.'
+      '  if ($removeFromSource) {'
+      '    $revLines = @(& git -C $repoRoot rev-list --reverse --topo-order --parents "$baseCommit..$expectedHead")'
+      '    if ($LASTEXITCODE -ne 0) { throw "git rev-list $baseCommit..$expectedHead failed" }'
+      '    $identityNames = @(''GIT_AUTHOR_NAME'', ''GIT_AUTHOR_EMAIL'', ''GIT_AUTHOR_DATE'', ''GIT_COMMITTER_NAME'', ''GIT_COMMITTER_EMAIL'', ''GIT_COMMITTER_DATE'')'
+      '    foreach ($revLine in $revLines) {'
+      '      $ids = @($revLine.Trim() -split ''\s+'')'
+      '      $oldCommit = $ids[0]'
+      '      $oldParents = @($ids | Select-Object -Skip 1)'
+      '      $newParents = @($oldParents | ForEach-Object { if ($commitMap.Contains($_)) { $commitMap[$_] } else { $_ } })'
+      '      Set-GitSplitEnv ''GIT_INDEX_FILE'' $tempIndexPath'
+      '      try {'
+      '        & git -C $repoRoot read-tree $oldCommit 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '        if ($LASTEXITCODE -ne 0) { throw "git read-tree $oldCommit failed" }'
+      '        & git -C $repoRoot reset -q $baseCommit -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+      '        if ($LASTEXITCODE -ne 0) { throw "git reset (extracted paths) for $oldCommit failed" }'
+      '        $tree = (& git -C $repoRoot write-tree).Trim()'
+      '        if ($LASTEXITCODE -ne 0 -or $tree -notmatch ''^[0-9a-f]{40}$'') { throw "git write-tree for $oldCommit failed" }'
+      '      }'
+      '      finally {'
+      '        Set-GitSplitEnv ''GIT_INDEX_FILE'' $savedGitEnv[''GIT_INDEX_FILE'']'
+      '      }'
+      '      if ($tree -eq (& git -C $repoRoot rev-parse "$oldCommit^{tree}").Trim() -and ($newParents -join '' '') -eq ($oldParents -join '' '')) {'
+      '        $commitMap[$oldCommit] = $oldCommit   # untouched and not re-parented: keep it, signature and all'
+      '        continue'
+      '      }'
+      '      if (-not $keepEmpty -and $newParents.Count -eq 1 -and $tree -eq (& git -C $repoRoot rev-parse "$($newParents[0])^{tree}").Trim()) {'
+      '        $commitMap[$oldCommit] = $newParents[0]   # it only changed the extracted paths: drop it'
+      '        $droppedCommits[$oldCommit] = $true'
+      '        continue'
+      '      }'
+      '      # Author/committer and message go through files, so their bytes never pass through the console encoding.'
+      '      & git -C $repoRoot log -1 "--pretty=format:%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd" --date=raw "--output=$identityPath" $oldCommit'
+      '      if ($LASTEXITCODE -ne 0) { throw "Failed to read the author and committer of $oldCommit" }'
+      '      $identity = @((Get-Content -LiteralPath $identityPath -Raw -Encoding UTF8) -split "`0")'
+      '      if ($identity.Count -ne 6) { throw "Unexpected author/committer format for $oldCommit" }'
+      '      & git -C $repoRoot log -1 --pretty=format:%B "--output=$messagePath" $oldCommit'
+      '      if ($LASTEXITCODE -ne 0) { throw "Failed to read the message of $oldCommit" }'
+      '      for ($i = 0; $i -lt $identityNames.Count; $i++) { Set-GitSplitEnv $identityNames[$i] $identity[$i] }'
+      '      try {'
+      '        $parentArgs = @($newParents | ForEach-Object { ''-p''; $_ })'
+      '        $newCommit = (& git -C $repoRoot commit-tree $tree @parentArgs -F $messagePath).Trim()'
+      '        if ($LASTEXITCODE -ne 0 -or $newCommit -notmatch ''^[0-9a-f]{40}$'') { throw "git commit-tree for $oldCommit failed" }'
+      '      }'
+      '      finally {'
+      '        foreach ($name in $identityNames) { Set-GitSplitEnv $name $savedGitEnv[$name] }'
+      '      }'
+      '      $commitMap[$oldCommit] = $newCommit'
+      '    }'
+      '    $sourceTip = $commitMap[$expectedHead]'
+      '  }'
     )
   }
+
+  # --- destination commit (both modes) ---
+  $execLines += @(
+    ''
+    '  # --- destination: $destBase + the extracted paths'' net change across BaseRef..HEAD ---'
+    '  # Applied as a 3-way patch in a temporary index, never as the paths'' whole HEAD snapshot: a'
+    '  # snapshot would also carry any edits made to the paths between an older -DestinationBase and'
+    '  # BaseRef. When stacked, $destBase is the rewritten source tip, whose paths sit at BaseRef.'
+    '  $destBase = if ($stacked) { $sourceTip } elseif ($destinationBaseCommit) { $destinationBaseCommit } else { $baseCommit }'
+    '  & git -C $repoRoot -c diff.noprefix=false -c diff.mnemonicPrefix=false diff --no-ext-diff --no-color --binary --full-index --no-renames "--output=$patchPath" $baseCommit $expectedHead -- @paths 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '  if ($LASTEXITCODE -ne 0) { throw "git diff (extracted paths) failed" }'
+    '  Set-GitSplitEnv ''GIT_INDEX_FILE'' $tempIndexPath'
+    '  try {'
+    '    & git -C $repoRoot read-tree $destBase 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
+    '    if ($LASTEXITCODE -ne 0) { throw "git read-tree (destination base) failed" }'
+    '    $applyOutput = @(& git -C $repoRoot apply --cached --3way $patchPath 2>&1 | ForEach-Object { "$_" })'
+    '    if ($LASTEXITCODE -ne 0) {'
+    '      throw ((@("The extracted paths'' changes in $baseCommit..$expectedHead do not apply cleanly onto $destBase. Choose a different -DestinationBase, or extract onto BaseRef:") + @($applyOutput | ForEach-Object { "  $_" })) -join [Environment]::NewLine)'
+    '    }'
+    '    $destTree = (& git -C $repoRoot write-tree).Trim()'
+    '    if ($LASTEXITCODE -ne 0 -or $destTree -notmatch ''^[0-9a-f]{40}$'') { throw "git write-tree (destination) failed" }'
+    '  }'
+    '  finally {'
+    '    Set-GitSplitEnv ''GIT_INDEX_FILE'' $savedGitEnv[''GIT_INDEX_FILE'']'
+    '  }'
+    '  if ($destTree -eq (& git -C $repoRoot rev-parse "$destBase^{tree}").Trim()) { throw "The extracted paths'' changes are already present on $destBase; the destination branch would be empty." }'
+    '  $destSha = (& git -C $repoRoot commit-tree $destTree -p $destBase -m $destinationMessage).Trim()'
+    '  if ($LASTEXITCODE -ne 0 -or $destSha -notmatch ''^[0-9a-f]{40}$'') { throw "Failed to create the destination commit." }'
+  )
 
   # --- ref updates (back in the main repo) ---
   $execLines += @(
@@ -5055,21 +5092,33 @@ function New-SplitByPathPlan {
     ''
     '  $succeeded = $true'
     '  Write-Host "Split-ByPath complete."'
-    '  Write-Host "  source:      $expectedBranch -> $(if ($removeFromSource) { $sourceTip } else { $expectedHead + '' (unchanged)'' })"'
+    '  if ($removeFromSource) {'
+    '    Write-Host "  source:      $expectedBranch $expectedHead -> $sourceTip"'
+    '  }'
+    '  else {'
+    '    Write-Host "  source:      $expectedBranch $expectedHead (unchanged)"'
+    '  }'
     '  Write-Host "  destination: $destinationBranch -> $destSha"'
+    '  if ($commitMap.Count -gt 0) {'
+    '    Write-Host "  rewritten commits (old -> new):"'
+    '    foreach ($entry in $commitMap.GetEnumerator()) {'
+    '      $newLabel = if ($droppedCommits.ContainsKey($entry.Key)) { "dropped (it only changed the extracted paths)" } else { $entry.Value }'
+    '      Write-Host "    $($entry.Key) -> $newLabel"'
+    '    }'
+    '  }'
+    '  elseif ($removeFromSource) {'
+    '    Write-Host "  every commit in $baseCommit..$expectedHead was squashed into $sourceTip"'
+    '  }'
     '  Write-Host "  (History rewrite changes commit SHAs; old SHAs cited in review threads may become dangling on GitHub after force-push.)"'
     '}'
     'finally {'
   )
 
-  if (-not $squash) {
-    $execLines += @(
-      '  if ($cloneCreated -and $clonePath -and (Test-Path -LiteralPath $clonePath)) {'
-      '    Remove-Item -LiteralPath $clonePath -Recurse -Force -ErrorAction SilentlyContinue'
-      '  }'
-    )
-  }
   $execLines += @(
+    '  foreach ($name in $gitEnvNames) { Set-GitSplitEnv $name $savedGitEnv[$name] }'
+    '  if ($scratchCreated -and (Test-Path -LiteralPath $scratchPath)) {'
+    '    Remove-Item -LiteralPath $scratchPath -Recurse -Force -ErrorAction SilentlyContinue'
+    '  }'
     '  if ($worktreeCreated -and $worktreePath -and (Test-Path -LiteralPath $worktreePath)) {'
     '    & git @longPathGitArgs worktree remove --force $worktreePath 2>&1 | ForEach-Object { $_ | Out-String | Write-Host }'
     '    if ($LASTEXITCODE -ne 0) { Write-Warning "Failed to remove worktree at ''$worktreePath''. Run: git worktree remove --force ''$worktreePath''" }'
@@ -5115,8 +5164,9 @@ function New-SplitByPathPlan {
   )
 
   $steps += New-GitStep -Kind Comment -Lines @(
-    'Execute the split in an isolated worktree (squash) or fresh clone (preserve), then update refs in the main repo.',
-    'Cleanup removes the temporary worktree/clone and restores any stash on all exit paths.'
+    'Build the source (squash: in an isolated worktree; preserve: replayed in a temporary index) and the',
+    'destination (a patch applied in a temporary index), then update refs in the main repo.',
+    'Cleanup removes the temporary worktree and scratch files and restores any stash on all exit paths.'
   )
   $steps += New-GitStep -Kind Literal -Lines $execLines
 
@@ -5162,7 +5212,7 @@ function Split-ByPath {
 
   .PARAMETER Squash
     Default $true: collapse the source to one squashed commit (pure git). -Squash:$false preserves the
-    source commit structure (requires git-filter-repo).
+    source commit structure, replaying each commit with the paths held at their BaseRef state.
 
   .PARAMETER RemoveFromSource
     Default $true (DESTRUCTIVE): rewrite the source branch to drop the extracted paths, like `mv`. Pass
@@ -5178,7 +5228,7 @@ function Split-ByPath {
     Stash uncommitted changes before the split and restore them after.
 
   .PARAMETER KeepEmpty
-    Preserve mode only: keep commits that become empty after excision (--prune-empty=off).
+    Preserve mode only: keep commits that become empty once the paths' changes are removed.
 
   .PARAMETER OutputScriptPath
     Write a reviewable script instead of executing immediately.

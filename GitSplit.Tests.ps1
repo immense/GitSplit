@@ -5896,15 +5896,78 @@ jobs:
       }
     }
 
-    Context "preserve mode (-Squash:`$false, git-filter-repo)" {
-      BeforeEach {
-        $script:FilterRepoAvailable = $null -ne (Get-Command git-filter-repo -ErrorAction SilentlyContinue)
-      }
+    It "applies only the BaseRef..HEAD change onto an older destination base (squash, flat)" {
+      Push-Location $script:TempRepoPath
+      try {
+        # Ten lines, so the edit before BaseRef and the edit inside the range sit far apart.
+        $lines = @(1..10 | ForEach-Object { "f-line-$_" })
+        $lines | Set-Content -Path 'f.txt'
+        git add f.txt | Out-Null
+        git commit -m 'Add f.txt' | Out-Null
+        $destBase = (git rev-parse HEAD).Trim()
 
-      It "rewrites the source keeping commit structure minus the extracted paths (destructive)" {
-        if (-not $script:FilterRepoAvailable) {
-          Set-ItResult -Skipped -Because "git-filter-repo is not installed; preserve mode requires it."
-        }
+        $lines[0] = 'f-line-1 (edited before BaseRef)'
+        $lines | Set-Content -Path 'f.txt'
+        git commit -am 'Edit f.txt line 1' | Out-Null
+        $baseRef = (git rev-parse HEAD).Trim()
+
+        $lines[9] = 'f-line-10 (edited in range)'
+        $lines | Set-Content -Path 'f.txt'
+        git commit -am 'Edit f.txt line 10' | Out-Null
+
+        $result = Split-ByPath -Path 'f.txt' -DestinationBranch 'sbp-olderbase' -BaseRef $baseRef -DestinationBase $destBase -RemoveFromSource:$false
+        $result | Should -Be 'sbp-olderbase'
+
+        # The destination carries the range's line-10 edit only; line 1 keeps the destination base's text.
+        (git rev-parse 'sbp-olderbase^').Trim() | Should -Be $destBase
+        $destLines = @(Get-FileAtCommit 'sbp-olderbase' 'f.txt')
+        $destLines[0] | Should -Be 'f-line-1'
+        $destLines[9] | Should -Be 'f-line-10 (edited in range)'
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "throws without moving any ref when the change does not apply onto the destination base" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $originalHead = (git rev-parse HEAD).Trim()
+        # "Initial" has no a.txt, but BaseRef..HEAD edits it: there is nothing to apply the edit to.
+        $initial = (git rev-parse HEAD~3).Trim()
+
+        { Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-noapply' -BaseRef 'HEAD~2' -DestinationBase $initial } |
+          Should -Throw '*do not apply cleanly*'
+
+        git show-ref --verify --quiet 'refs/heads/sbp-noapply'
+        $LASTEXITCODE | Should -Not -Be 0
+        (git rev-parse $sourceBranch).Trim() | Should -Be $originalHead
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    It "prints the source's old and new tip on completion (squash)" {
+      Push-Location $script:TempRepoPath
+      try {
+        $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+        $originalHead = (git rev-parse HEAD).Trim()
+
+        $output = Split-ByPath -Path 'a.txt' -DestinationBranch 'sbp-output' -BaseRef 'HEAD~2' 6>&1 | Out-String
+
+        $newSourceTip = (git rev-parse $sourceBranch).Trim()
+        $output | Should -Match ([regex]::Escape("$sourceBranch $originalHead -> $newSourceTip"))
+        $output | Should -Match ([regex]::Escape("was squashed into $newSourceTip"))
+      }
+      finally {
+        Pop-Location
+      }
+    }
+
+    Context "preserve mode (-Squash:`$false)" {
+      It "rewrites only BaseRef..HEAD, keeping commit structure and restoring the paths to BaseRef (destructive)" {
         Push-Location $script:TempRepoPath
         try {
           $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
@@ -5918,19 +5981,46 @@ jobs:
           $result | Should -Be 'sbp-preserve'
 
           $newSourceTip = (git rev-parse $sourceBranch).Trim()
-          # filter-repo rewrites the whole history (it strips a.txt from every commit, including the
-          # base), so the old $baseCommit SHA is no longer an ancestor of the rewritten tip. Resolve the
-          # REWRITTEN base from the new tip and compare within the rewritten history.
           $newSourceTip | Should -Not -Be $originalHead
-          $rewrittenBase = (git rev-parse "$newSourceTip~$originalCommitCount").Trim()
-          # filter-repo preserves commit structure (no squash): the in-range commit count is unchanged.
-          $newCommitCount = [int](git rev-list --count "$rewrittenBase..$newSourceTip").Trim()
+          # Only BaseRef..HEAD is rewritten: the base itself (where a.txt already existed) stays in the
+          # history, and the in-range commit count is unchanged.
+          (git rev-parse "$newSourceTip~$originalCommitCount").Trim() | Should -Be $baseCommit
+          $newCommitCount = [int](git rev-list --count "$baseCommit..$newSourceTip").Trim()
           $newCommitCount | Should -Be $originalCommitCount
-          # a.txt change excised from the source range (rewritten-base .. rewritten-tip).
-          (git diff --name-only $rewrittenBase $newSourceTip) | Should -Not -Contain 'a.txt'
-          # Destination is stacked on the rewritten source and carries a.txt.
+          # a.txt is back at its BaseRef content on the source (not deleted); b.txt keeps its edits.
+          (git diff --name-only $baseCommit $newSourceTip) | Should -Be 'b.txt'
+          (Get-FileAtCommit $newSourceTip 'a.txt') | Should -Be (Get-FileAtCommit $baseCommit 'a.txt')
+          # Destination is stacked on the rewritten source and carries only a.txt's change.
           (git rev-parse 'sbp-preserve^').Trim() | Should -Be $newSourceTip
           (git diff --name-only $newSourceTip 'sbp-preserve') | Should -Be 'a.txt'
+          (Get-FileAtCommit 'sbp-preserve' 'a.txt') | Should -Be (Get-FileAtCommit $originalHead 'a.txt')
+        }
+        finally {
+          Pop-Location
+        }
+      }
+
+      It "keeps commits that never touched the paths and drops commits that only changed them (preserve)" {
+        Push-Location $script:TempRepoPath
+        try {
+          $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+          'c-line-1' | Set-Content -Path 'c.txt'
+          git add c.txt | Out-Null
+          git commit -m 'Add c.txt' | Out-Null
+          $untouched = (git rev-parse HEAD).Trim()
+          'd-line-1' | Set-Content -Path 'd.txt'
+          git add d.txt | Out-Null
+          git commit -m 'Add d.txt' | Out-Null
+          $onlyPath = (git rev-parse HEAD).Trim()
+
+          $output = Split-ByPath -Path 'd.txt' -DestinationBranch 'sbp-preserve-drop' -BaseRef 'HEAD~2' -Squash:$false 6>&1 | Out-String
+
+          # "Add c.txt" never touched d.txt, so it keeps its SHA; "Add d.txt" only added d.txt and is dropped.
+          (git rev-parse $sourceBranch).Trim() | Should -Be $untouched
+          $output | Should -Match ([regex]::Escape("$untouched -> $untouched"))
+          $output | Should -Match ([regex]::Escape("$onlyPath -> dropped"))
+          (git rev-parse 'sbp-preserve-drop^').Trim() | Should -Be $untouched
+          (git diff --name-only $untouched 'sbp-preserve-drop') | Should -Be 'd.txt'
         }
         finally {
           Pop-Location
@@ -5938,9 +6028,6 @@ jobs:
       }
 
       It "leaves the source untouched in copy mode (preserve)" {
-        if (-not $script:FilterRepoAvailable) {
-          Set-ItResult -Skipped -Because "git-filter-repo is not installed; preserve mode requires it."
-        }
         Push-Location $script:TempRepoPath
         try {
           $sourceBranch = (git rev-parse --abbrev-ref HEAD).Trim()
